@@ -79,16 +79,48 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            return report
+        observed = ctx.observed_text
+        kept = []
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if any(text in line for line in observed.splitlines()):
+                kept.append(claim)
+                continue
+            # Only cut substrings the model wrote; never paste corpus text.
+            split = self._split_supported(ctx, claim, text)
+            if split:
+                kept.extend(split)
+                report["abstain"] = True
+        report["claims"] = kept
+        report["citations"] = sorted({c["doc_id"] for c in kept
+                                      if isinstance(c.get("doc_id"), str)})
+        if not kept:
+            report["abstain"] = True
+            report["answer"] = "Không đủ căn cứ trong tài liệu đã quan sát để trả lời."
+        return report
+
+    @staticmethod
+    def _split_supported(ctx, claim, text):
+        if ctx.corpus is None:
+            return []
+        observed_docs = [d for d in ctx.corpus.docs if d.body and d.body in ctx.observed_text]
+        offset = text.find(" và ")
+        while offset >= 0:
+            left, right = text[:offset], text[offset + len(" và "):]
+            if left.strip() and right.strip():
+                left_docs = [d for d in observed_docs if any(left in line for line in d.body.splitlines())]
+                right_docs = [d for d in observed_docs if any(right in line for line in d.body.splitlines())]
+                for first in left_docs:
+                    for second in right_docs:
+                        if first.doc_id != second.doc_id:
+                            return [{**claim, "text": left, "doc_id": first.doc_id},
+                                    {**claim, "text": right, "doc_id": second.doc_id}]
+            offset = text.find(" và ", offset + 1)
+        return []
